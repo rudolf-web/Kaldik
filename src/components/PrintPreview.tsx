@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { CalendarEvent, SchoolConfig, YearAnalysis } from '../types';
 import { EVENT_CATEGORIES } from '../data';
 import { CalendarGrid } from './CalendarGrid';
@@ -6,6 +6,19 @@ import { AnalysisTable } from './AnalysisTable';
 import { Printer, ArrowLeft, Download, ClipboardList } from 'lucide-react';
 import { toPng, toJpeg } from 'html-to-image';
 import { generateMonthData, getMonthNameIndonesian } from '../utils';
+import { uploadExportToDrive } from '../lib/drive';
+import { User as FirebaseUser } from 'firebase/auth';
+
+const dataURItoBlob = (dataURI: string) => {
+  const byteString = atob(dataURI.split(',')[1]);
+  const mimeString = dataURI.split(',')[0].split(':')[1].split(';')[0];
+  const ab = new ArrayBuffer(byteString.length);
+  const ia = new Uint8Array(ab);
+  for (let i = 0; i < byteString.length; i++) {
+    ia[i] = byteString.charCodeAt(i);
+  }
+  return new Blob([ab], { type: mimeString });
+};
 
 const getMonthEvents = (monthIndex: number, startYear: number, events: CalendarEvent[]): { event: CalendarEvent; datesText: string }[] => {
   const { year, month } = generateMonthData(monthIndex, startYear);
@@ -51,11 +64,75 @@ interface PrintPreviewProps {
   events: CalendarEvent[];
   analysis: YearAnalysis;
   onBack: () => void;
+  gUser: FirebaseUser | null;
+  gToken: string | null;
+  onGoogleLogin: () => Promise<void>;
 }
 
-export const PrintPreview: React.FC<PrintPreviewProps> = ({ config, events, analysis, onBack }) => {
+export const PrintPreview: React.FC<PrintPreviewProps> = ({
+  config,
+  events,
+  analysis,
+  onBack,
+  gUser,
+  gToken,
+  onGoogleLogin,
+}) => {
+  const [isUploadingToDrive, setIsUploadingToDrive] = useState(false);
+
   const handlePrint = () => {
     window.print();
+  };
+
+  const handleUploadToDrive = async (format: 'png' | 'jpeg') => {
+    if (!gToken) {
+      alert("Harap hubungkan Google Drive Anda terlebih dahulu.");
+      return;
+    }
+
+    const element = document.getElementById('printable-kaldik-sheet');
+    if (!element) {
+      alert("Elemen lembar kalender tidak ditemukan!");
+      return;
+    }
+
+    setIsUploadingToDrive(true);
+    try {
+      const options = {
+        quality: 0.95,
+        pixelRatio: 2,
+        backgroundColor: '#ffffff',
+        style: {
+          transform: 'scale(1)',
+          transformOrigin: 'top left',
+          borderRadius: '0px',
+          boxShadow: 'none',
+          border: 'none',
+        }
+      };
+
+      let dataUrl = '';
+      if (format === 'png') {
+        dataUrl = await toPng(element, options);
+      } else {
+        dataUrl = await toJpeg(element, options);
+      }
+
+      const mimeType = format === 'png' ? 'image/png' : 'image/jpeg';
+      const blob = dataURItoBlob(dataUrl);
+      
+      const sanitizedSchoolName = config.schoolName.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+      const sanitizedYear = config.schoolYear.replace('/', '_');
+      const fileName = `kaldik_${sanitizedSchoolName}_${sanitizedYear}.${format}`;
+
+      const res = await uploadExportToDrive(gToken, fileName, mimeType, blob);
+      alert(`Berhasil mengunggah hasil cetak "${res.name}" ke Google Drive!`);
+    } catch (error: any) {
+      console.error('Error uploading to Google Drive:', error);
+      alert(`Gagal mengunggah gambar ke Google Drive: ${error.message}`);
+    } finally {
+      setIsUploadingToDrive(false);
+    }
   };
 
   const handleDownloadImage = async (format: 'png' | 'jpeg') => {
@@ -117,6 +194,40 @@ export const PrintPreview: React.FC<PrintPreviewProps> = ({ config, events, anal
         </div>
 
         <div className="flex items-center flex-wrap gap-2.5">
+          {gUser ? (
+            <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 p-1 rounded-lg">
+              <button
+                onClick={() => handleUploadToDrive('png')}
+                disabled={isUploadingToDrive}
+                className="bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold rounded-md px-3 py-1.5 text-xs flex items-center gap-1.5 shadow-xs transition-all cursor-pointer"
+                title="Simpan cetakan PNG langsung ke Google Drive"
+              >
+                {isUploadingToDrive ? 'Mengunggah...' : 'Simpan ke Drive (PNG)'}
+              </button>
+              <button
+                onClick={() => handleUploadToDrive('jpeg')}
+                disabled={isUploadingToDrive}
+                className="bg-sky-600 hover:bg-sky-700 disabled:bg-sky-400 text-white font-semibold rounded-md px-3 py-1.5 text-xs flex items-center gap-1.5 shadow-xs transition-all cursor-pointer"
+                title="Simpan cetakan JPG langsung ke Google Drive"
+              >
+                {isUploadingToDrive ? 'Mengunggah...' : 'Simpan ke Drive (JPG)'}
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={onGoogleLogin}
+              className="bg-white hover:bg-slate-50 text-slate-700 font-semibold border border-slate-200 rounded-lg px-3.5 py-2 text-xs flex items-center gap-1.5 shadow-xs transition-all cursor-pointer"
+              title="Hubungkan Google Drive untuk menyimpan cetakan secara awan"
+            >
+              <svg viewBox="0 0 87.3 78" className="w-3.5 h-3.5">
+                <path fill="#0066da" d="M6.2 19l19.5 33.7 13-22.5L25.7 1z"/>
+                <path fill="#00ac47" d="M38.7 30.2L25.7 52.7h39l13-22.5z"/>
+                <path fill="#ffba00" d="M19.2 52.7L6.2 75.2h52L71.2 52.7z"/>
+              </svg>
+              Hubungkan Drive
+            </button>
+          )}
+
           <button
             onClick={() => handleDownloadImage('png')}
             className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg px-4 py-2 text-xs flex items-center gap-1.5 shadow-sm transition-all cursor-pointer"

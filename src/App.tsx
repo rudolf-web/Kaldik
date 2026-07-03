@@ -6,6 +6,17 @@ import { CalendarGrid } from './components/CalendarGrid';
 import { EventForm } from './components/EventForm';
 import { AnalysisTable } from './components/AnalysisTable';
 import { PrintPreview } from './components/PrintPreview';
+import { User as FirebaseUser } from 'firebase/auth';
+import {
+  initAuth,
+  googleSignIn,
+  logout as googleLogout,
+  listKaldikFiles,
+  loadKaldikFile,
+  saveKaldikFile,
+  deleteKaldikFile,
+  DriveFile
+} from './lib/drive';
 import {
   Printer,
   Sparkles,
@@ -117,6 +128,15 @@ export default function App() {
   // Time indicator (UTC / Local)
   const [currentTime, setCurrentTime] = useState('');
 
+  // Google Drive state
+  const [gUser, setGUser] = useState<FirebaseUser | null>(null);
+  const [gToken, setGToken] = useState<string | null>(null);
+  const [driveFiles, setDriveFiles] = useState<DriveFile[]>([]);
+  const [isDriveLoading, setIsDriveLoading] = useState(false);
+  const [currentDriveFileId, setCurrentDriveFileId] = useState<string | null>(null);
+  const [isSavingToDrive, setIsSavingToDrive] = useState(false);
+  const [driveFileName, setDriveFileName] = useState('');
+
   // --- Effects ---
   // Live Clock effect
   useEffect(() => {
@@ -136,6 +156,39 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
+  // Initialize Google auth and list files
+  useEffect(() => {
+    const unsubscribe = initAuth(
+      (user, token) => {
+        setGUser(user);
+        setGToken(token);
+      },
+      () => {
+        setGUser(null);
+        setGToken(null);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
+  // Set default drive filename based on active schoolName and schoolYear
+  useEffect(() => {
+    if (config) {
+      const sanitizedSchoolName = config.schoolName.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
+      const sanitizedYear = config.schoolYear.replace('/', '_');
+      setDriveFileName(`kaldik_${sanitizedSchoolName}_${sanitizedYear}`);
+    }
+  }, [config.schoolName, config.schoolYear]);
+
+  // Load drive files on login
+  useEffect(() => {
+    if (gToken) {
+      loadDriveFiles();
+    } else {
+      setDriveFiles([]);
+    }
+  }, [gToken]);
+
   // Save config to local storage
   useEffect(() => {
     localStorage.setItem(LOCAL_STORAGE_KEY_CONFIG, JSON.stringify(config));
@@ -150,6 +203,127 @@ export default function App() {
   const analysis: YearAnalysis = calculateYearAnalysis(config.startYear, events, config.isSixDayWeek);
 
   // --- Handlers ---
+  const loadDriveFiles = async () => {
+    if (!gToken) return;
+    setIsDriveLoading(true);
+    try {
+      const files = await listKaldikFiles(gToken);
+      setDriveFiles(files);
+    } catch (err: any) {
+      console.error(err);
+    } finally {
+      setIsDriveLoading(false);
+    }
+  };
+
+  const handleGoogleLogin = async () => {
+    setIsDriveLoading(true);
+    try {
+      const result = await googleSignIn();
+      if (result) {
+        setGUser(result.user);
+        setGToken(result.accessToken);
+        alert(`Berhasil masuk sebagai ${result.user.displayName}!`);
+      }
+    } catch (err: any) {
+      alert(`Gagal login Google: ${err.message}`);
+    } finally {
+      setIsDriveLoading(false);
+    }
+  };
+
+  const handleGoogleLogout = async () => {
+    try {
+      await googleLogout();
+      setGUser(null);
+      setGToken(null);
+      setCurrentDriveFileId(null);
+      setDriveFiles([]);
+      alert("Berhasil keluar dari akun Google.");
+    } catch (err: any) {
+      alert(`Gagal logout: ${err.message}`);
+    }
+  };
+
+  const handleSaveToDrive = async (overwrite: boolean) => {
+    if (!gToken) {
+      alert("Harap hubungkan akun Google Drive Anda terlebih dahulu.");
+      return;
+    }
+    if (!driveFileName.trim()) {
+      alert("Harap masukkan nama file.");
+      return;
+    }
+
+    setIsSavingToDrive(true);
+    try {
+      const fileId = overwrite ? currentDriveFileId : null;
+      const res = await saveKaldikFile(gToken, driveFileName, fileId, { config, events });
+      setCurrentDriveFileId(res.id);
+      
+      if (res.name) {
+        setDriveFileName(res.name.replace(/\.kaldik$/, ''));
+      }
+      
+      alert(`Berhasil menyimpan file "${res.name}" ke Google Drive!`);
+      await loadDriveFiles();
+    } catch (err: any) {
+      alert(`Gagal menyimpan ke Google Drive: ${err.message}`);
+    } finally {
+      setIsSavingToDrive(false);
+    }
+  };
+
+  const handleLoadFromDrive = async (file: DriveFile) => {
+    if (!gToken) return;
+    const confirmLoad = window.confirm(
+      `Apakah Anda yakin ingin memuat draf "${file.name}" dari Google Drive? Seluruh rancangan kalender aktif Anda akan digantikan.`
+    );
+    if (!confirmLoad) return;
+
+    setIsDriveLoading(true);
+    try {
+      const data = await loadKaldikFile(gToken, file.id);
+      if (data && typeof data === 'object') {
+        if (data.config) {
+          setConfig({ ...DEFAULT_CONFIG, ...data.config });
+        }
+        if (data.events && Array.isArray(data.events)) {
+          setEvents(data.events);
+        }
+        setCurrentDriveFileId(file.id);
+        setDriveFileName(file.name.replace(/\.kaldik$/, ''));
+        alert(`Berhasil memuat draf "${file.name}" dari Google Drive!`);
+      }
+    } catch (err: any) {
+      alert(`Gagal memuat file dari Google Drive: ${err.message}`);
+    } finally {
+      setIsDriveLoading(false);
+    }
+  };
+
+  const handleDeleteFromDrive = async (file: DriveFile) => {
+    if (!gToken) return;
+    const confirmDelete = window.confirm(
+      `Apakah Anda yakin ingin menghapus file "${file.name}" secara permanen dari Google Drive? Tindakan ini tidak dapat dibatalkan.`
+    );
+    if (!confirmDelete) return;
+
+    setIsDriveLoading(true);
+    try {
+      await deleteKaldikFile(gToken, file.id);
+      if (currentDriveFileId === file.id) {
+        setCurrentDriveFileId(null);
+      }
+      alert(`Berhasil menghapus file "${file.name}" dari Google Drive.`);
+      await loadDriveFiles();
+    } catch (err: any) {
+      alert(`Gagal menghapus file: ${err.message}`);
+    } finally {
+      setIsDriveLoading(false);
+    }
+  };
+
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -341,6 +515,9 @@ export default function App() {
         events={events}
         analysis={analysis}
         onBack={() => setShowPrintView(false)}
+        gUser={gUser}
+        gToken={gToken}
+        onGoogleLogin={handleGoogleLogin}
       />
     );
   }
@@ -866,51 +1043,240 @@ export default function App() {
 
             {/* TAB CONTENT: BACKUP (SAVE / LOAD) */}
             {settingsTab === 'backup' && (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs animate-in fade-in duration-150">
-                {/* Save Section */}
-                <div className="bg-slate-50 border border-slate-200 rounded-xl p-5 flex flex-col justify-between">
-                  <div>
-                    <h3 className="font-extrabold text-slate-800 text-sm mb-1.5 flex items-center gap-1.5">
-                      <Download size={16} className="text-emerald-600" />
-                      Ekspor Desain Kaldik (.JSON)
-                    </h3>
-                    <p className="text-slate-500 leading-relaxed mb-4">
-                      Simpan seluruh rancangan kalender pendidikan ini ke komputer Anda. File cadangan ini akan merekam seluruh data kegiatan sekolah, hari libur, identitas sekolah, serta semua pengaturan gaya visual kustomisasi Anda secara komprehensif.
-                    </p>
+              <div className="space-y-6 text-xs animate-in fade-in duration-150">
+                {/* Google Drive Integration Card */}
+                <div className="bg-slate-50 border border-blue-100 rounded-xl p-5 shadow-xs">
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b border-slate-200 pb-4 mb-4 gap-4">
+                    <div className="flex items-center gap-3">
+                      <div className="w-8 h-8 flex items-center justify-center bg-white rounded-xl shadow-xs border border-slate-100">
+                        <svg viewBox="0 0 87.3 78" className="w-5 h-5">
+                          <path fill="#0066da" d="M6.2 19l19.5 33.7 13-22.5L25.7 1z"/>
+                          <path fill="#00ac47" d="M38.7 30.2L25.7 52.7h39l13-22.5z"/>
+                          <path fill="#ffba00" d="M19.2 52.7L6.2 75.2h52L71.2 52.7z"/>
+                        </svg>
+                      </div>
+                      <div>
+                        <h3 className="font-extrabold text-slate-800 text-sm">Penyimpanan Awan Google Drive</h3>
+                        <p className="text-[10px] text-slate-500">Sinkronisasikan, cadangkan, dan muat rancangan kalender pendidikan Anda langsung dengan Google Drive.</p>
+                      </div>
+                    </div>
+
+                    {/* User Auth State Control */}
+                    {gUser ? (
+                      <div className="flex items-center gap-2.5 bg-white px-3 py-1.5 rounded-full border border-slate-200 shadow-xs">
+                        {gUser.photoURL && (
+                          <img src={gUser.photoURL} alt="Foto Profil" className="w-6 h-6 rounded-full border border-slate-100" referrerPolicy="no-referrer" />
+                        )}
+                        <div className="text-left">
+                          <p className="font-bold text-[10px] text-slate-800 leading-tight">{gUser.displayName}</p>
+                          <p className="text-[9px] text-slate-400 leading-none">{gUser.email}</p>
+                        </div>
+                        <button
+                          onClick={handleGoogleLogout}
+                          className="ml-1 text-[9px] font-bold text-red-600 hover:text-white bg-red-50 hover:bg-red-600 border border-red-200/50 rounded-full px-2.5 py-1 cursor-pointer transition-all"
+                        >
+                          Keluar
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={handleGoogleLogin}
+                        disabled={isDriveLoading}
+                        className="flex items-center gap-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-lg px-3.5 py-2 font-bold cursor-pointer disabled:opacity-50 shadow-xs hover:shadow-sm transition-all"
+                      >
+                        <svg version="1.1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" className="w-4 h-4">
+                          <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"></path>
+                          <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"></path>
+                          <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"></path>
+                          <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"></path>
+                          <path fill="none" d="M0 0h48v48H0z"></path>
+                        </svg>
+                        Hubungkan Google Drive
+                      </button>
+                    )}
                   </div>
-                  <button
-                    onClick={handleExportJSON}
-                    className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 shadow-sm hover:shadow-md transition-all cursor-pointer"
-                  >
-                    <Download size={15} /> Simpan File Desain
-                  </button>
+
+                  {gUser ? (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                      {/* Simpan file */}
+                      <div className="bg-white border border-slate-200 rounded-lg p-4 flex flex-col justify-between shadow-xs">
+                        <div>
+                          <h4 className="font-extrabold text-slate-800 text-xs mb-2 flex items-center gap-1.5">
+                            <Download size={14} className="text-blue-600" />
+                            Simpan Kaldik ke Drive
+                          </h4>
+                          <p className="text-[10px] text-slate-500 leading-relaxed mb-4">
+                            Simpan rancangan kalender pendidikan aktif Anda langsung ke akun Google Drive Anda agar aman dan dapat diakses dari perangkat lain.
+                          </p>
+
+                          <div className="mb-4">
+                            <label className="block text-[10px] font-extrabold text-slate-500 mb-1">Nama File di Drive</label>
+                            <div className="flex gap-1">
+                              <input
+                                type="text"
+                                value={driveFileName}
+                                onChange={(e) => setDriveFileName(e.target.value)}
+                                className="flex-1 border border-slate-200 rounded-lg p-2 focus:outline-none focus:ring-1 focus:ring-blue-500 text-xs font-medium"
+                                placeholder="nama_file_kaldik"
+                              />
+                              <span className="self-center font-mono text-[10px] text-slate-400 bg-slate-50 px-2 py-1.5 rounded-md border border-slate-200/50">
+                                .kaldik
+                              </span>
+                            </div>
+                          </div>
+
+                          {currentDriveFileId && (
+                            <div className="bg-blue-50 border border-blue-200/30 rounded-lg p-2.5 mb-4 text-[10px] text-blue-800 flex items-center justify-between">
+                              <span>Menghubungkan draf aktif Google Drive.</span>
+                              <button
+                                onClick={() => setCurrentDriveFileId(null)}
+                                className="text-[9px] underline font-bold cursor-pointer hover:text-blue-950"
+                              >
+                                Buat Baru
+                              </button>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="flex gap-2">
+                          {currentDriveFileId && (
+                            <button
+                              onClick={() => handleSaveToDrive(true)}
+                              disabled={isSavingToDrive}
+                              className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white font-bold py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 cursor-pointer transition-all"
+                            >
+                              {isSavingToDrive ? 'Menyimpan...' : 'Perbarui File'}
+                            </button>
+                          )}
+                          <button
+                            onClick={() => handleSaveToDrive(false)}
+                            disabled={isSavingToDrive}
+                            className={`flex-1 font-bold py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 cursor-pointer transition-all ${
+                              currentDriveFileId 
+                                ? 'border border-slate-200 text-slate-700 bg-white hover:bg-slate-50' 
+                                : 'bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white'
+                            }`}
+                          >
+                            {isSavingToDrive && !currentDriveFileId ? 'Menyimpan...' : 'Simpan Baru'}
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Daftar file */}
+                      <div className="bg-white border border-slate-200 rounded-lg p-4 flex flex-col shadow-xs">
+                        <h4 className="font-extrabold text-slate-800 text-xs mb-2.5 flex items-center justify-between">
+                          <span className="flex items-center gap-1.5">
+                            <Database size={14} className="text-emerald-600" />
+                            File Kaldik di Google Drive
+                          </span>
+                          <button
+                            onClick={loadDriveFiles}
+                            disabled={isDriveLoading}
+                            className="text-[10px] text-blue-600 hover:text-blue-800 underline font-semibold cursor-pointer disabled:opacity-50"
+                          >
+                            Segarkan
+                          </button>
+                        </h4>
+
+                        {isDriveLoading ? (
+                          <div className="flex-grow flex flex-col items-center justify-center py-8 text-slate-400">
+                            <span className="animate-spin inline-block w-4 h-4 border-2 border-slate-300 border-t-blue-600 rounded-full mb-1"></span>
+                            <span>Memuat file...</span>
+                          </div>
+                        ) : driveFiles.length > 0 ? (
+                          <div className="flex-grow max-h-44 overflow-y-auto border border-slate-150 rounded-lg divide-y divide-slate-100 bg-slate-50/10">
+                            {driveFiles.map((file) => (
+                              <div key={file.id} className="flex items-center justify-between p-2 text-[10.5px] hover:bg-slate-50/50">
+                                <div className="min-w-0 flex-1 pr-2">
+                                  <p className="font-bold text-slate-700 truncate" title={file.name}>
+                                    {file.name}
+                                  </p>
+                                  <p className="text-[8.5px] text-slate-400">
+                                    Diubah: {new Date(file.modifiedTime).toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' })}
+                                  </p>
+                                </div>
+                                <div className="flex gap-1 flex-shrink-0">
+                                  <button
+                                    onClick={() => handleLoadFromDrive(file)}
+                                    className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200/30 font-bold px-2 py-0.5 rounded text-[10px] cursor-pointer"
+                                  >
+                                    Buka
+                                  </button>
+                                  <button
+                                    onClick={() => handleDeleteFromDrive(file)}
+                                    className="bg-red-50 hover:bg-red-100 text-red-700 border border-red-200/30 font-bold px-1.5 py-0.5 rounded text-[10px] cursor-pointer"
+                                    title="Hapus permanen"
+                                  >
+                                    Hapus
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="flex-grow flex flex-col items-center justify-center py-8 text-slate-400 italic text-[10px]">
+                            Belum ada file draf .kaldik di Google Drive Anda.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="bg-blue-50/30 border border-blue-100/30 rounded-lg p-5 text-center text-slate-500">
+                      <p className="font-extrabold text-slate-700 mb-1">Mendukung Pencadangan Otomatis Awan</p>
+                      <p className="text-[10.5px] leading-relaxed max-w-md mx-auto">
+                        Hubungkan akun Google Drive Anda untuk menyimpan seluruh setelan kalender pendidikan secara awan (Cloud), melacak versi draf desain, serta mengekspor langsung hasil cetakan.
+                      </p>
+                    </div>
+                  )}
                 </div>
 
-                {/* Load Section */}
-                <div className="bg-slate-50 border border-slate-200 rounded-xl p-5 flex flex-col justify-between">
-                  <div>
-                    <h3 className="font-extrabold text-slate-800 text-sm mb-1.5 flex items-center gap-1.5">
-                      <Upload size={16} className="text-indigo-600 animate-pulse" />
-                      Impor File Desain (.JSON)
-                    </h3>
-                    <p className="text-slate-500 leading-relaxed mb-4">
-                      Memuat rancangan kalender pendidikan dari file .JSON yang sebelumnya telah Anda ekspor. Proses ini akan menggantikan seluruh data kegiatan dan desain visual aktif dengan pengaturan yang disimpan dari file tersebut.
-                    </p>
-                  </div>
-                  <div className="relative">
-                    <input
-                      type="file"
-                      accept=".json"
-                      onChange={handleImportJSON}
-                      id="json-file-input"
-                      className="hidden"
-                    />
+                {/* Local JSON backup block */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  {/* Save Section */}
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-5 flex flex-col justify-between">
+                    <div>
+                      <h3 className="font-extrabold text-slate-800 text-sm mb-1.5 flex items-center gap-1.5">
+                        <Download size={16} className="text-emerald-600" />
+                        Ekspor Desain Kaldik Lokal (.JSON)
+                      </h3>
+                      <p className="text-slate-500 leading-relaxed mb-4">
+                        Simpan rancangan kalender pendidikan ini ke komputer lokal Anda. File cadangan ini akan merekam seluruh data kegiatan sekolah, hari libur, identitas sekolah, serta pengaturan gaya visual Anda.
+                      </p>
+                    </div>
                     <button
-                      onClick={() => document.getElementById('json-file-input')?.click()}
-                      className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 shadow-sm hover:shadow-md transition-all cursor-pointer"
+                      onClick={handleExportJSON}
+                      className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 shadow-sm hover:shadow-md transition-all cursor-pointer"
                     >
-                      <Upload size={15} /> Unggah & Muat File Desain
+                      <Download size={15} /> Simpan File Desain
                     </button>
+                  </div>
+
+                  {/* Load Section */}
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-5 flex flex-col justify-between">
+                    <div>
+                      <h3 className="font-extrabold text-slate-800 text-sm mb-1.5 flex items-center gap-1.5">
+                        <Upload size={16} className="text-indigo-600 animate-pulse" />
+                        Impor File Desain Lokal (.JSON)
+                      </h3>
+                      <p className="text-slate-500 leading-relaxed mb-4">
+                        Memuat rancangan kalender pendidikan dari file .JSON lokal yang telah diekspor sebelumnya. Proses ini akan menggantikan seluruh data kegiatan dan desain aktif dengan setelan dari file lokal tersebut.
+                      </p>
+                    </div>
+                    <div className="relative">
+                      <input
+                        type="file"
+                        accept=".json"
+                        onChange={handleImportJSON}
+                        id="json-file-input"
+                        className="hidden"
+                      />
+                      <button
+                        onClick={() => document.getElementById('json-file-input')?.click()}
+                        className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 shadow-sm hover:shadow-md transition-all cursor-pointer"
+                      >
+                        <Upload size={15} /> Unggah & Muat File Desain
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
