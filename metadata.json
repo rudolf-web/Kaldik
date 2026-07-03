@@ -1,0 +1,6 @@
+{
+  "name": "Kaldik Generator SD MIMI",
+  "description": "Professional and interactive Kalender Pendidikan (Kaldik) Generator for SD MIMI by Rudolf A. Luhukay.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
